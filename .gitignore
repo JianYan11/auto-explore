@@ -1,0 +1,18 @@
+# Local configuration and caches
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+
+# Test suites and generated data kept outside this source repository
+component-test/
+false/
+gov_finance_20261010/
+hash_test/
+output/
+reports/
+tests/
+tmp/
