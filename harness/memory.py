@@ -9,10 +9,10 @@ import re
 from typing import Any
 
 from .config import ExplorerConfig
-from .content_profile import sanitize_inventory
+from .evidence import sanitize_inventory
 from .contracts import ActionSequenceStep, AppGraph
 from .knowledge import derive_experiences, exploration_checklist, valid_observation
-from .node_memory import build_node_evidence, live_node_evidence
+from .evidence import build_node_evidence, live_node_evidence
 
 
 def usable_input(text: object) -> bool:
@@ -83,8 +83,6 @@ class GraphMemory:
         self.historical: list[dict] = []
         self.observations: list[dict] = []
         self.content_inventories: list[dict] = []
-        self.summary_service = None
-        self.node_function_service = None
         self.capability_service = None
         self.capability_graphs = []
         self.historical_node_evidence: dict[str, dict] = {}
@@ -326,14 +324,7 @@ class GraphMemory:
             item["variants"] = [{"outcome": v["outcome"], "target": v["target"],
                                  "count": len(v["evidence_ids"])} for v in experience["variants"][:3]]
             item["advisory_only"] = True
-            if self.summary_service:
-                summary = self.summary_service.summarize(experience)
-                if summary is not None:
-                    item["model_summary"] = summary
             result["experiences"].append(item)
-            if len(json.dumps(result, ensure_ascii=False)) > self.config.memory_max_chars // 2:
-                # Keep the factual experience if the optional prose exceeds its context allocation.
-                item.pop("model_summary", None)
             if len(json.dumps(result, ensure_ascii=False)) > self.config.memory_max_chars // 2:
                 result["experiences"].pop()
                 break
@@ -355,15 +346,13 @@ class GraphMemory:
             item = {**record, "outcomes": list(record["outcomes"]), "controls": list(record["controls"]),
                     "content_hints": list(record["content_hints"]), "entry_path": list(record["entry_path"]),
                     "checklist": list(record["checklist"]), "states": list(record["states"])}
-            if self.node_function_service and purpose in {"action", "schedule"}:
+            if purpose in {"action", "schedule"}:
                 historical = record["source"] != "live"
                 evidence = (self.historical_node_evidence.get(record["memory_id"]) if historical else
                             live_node_evidence(graph, graph.pages[record["page_id"]]))
                 if evidence is not None:
-                    item["node_function_memory"] = self.node_function_service.context(
-                        evidence, historical=historical,
-                        max_chars=min(2400, max(400, self.config.memory_max_chars // 3)),
-                    )
+                    # Deterministic case evidence, without an extra model call.
+                    item["node_evidence"] = {**evidence, "historical": historical, "advisory_only": True}
             if purpose == "analyze":
                 item["checklist"] = []  # Identity analysis needs surfaces, not action progress.
             if purpose == "schedule":
@@ -371,11 +360,11 @@ class GraphMemory:
                 item["entry_path_truncated"] = item["entry_path_length"] > 0
             result["pages"].append(item)
             while len(json.dumps(result, ensure_ascii=False)) > self.config.memory_max_chars:
-                # Keep the current node's functional interpretation ahead of less
+                # Keep the current node's case evidence ahead of less
                 # relevant historical pages, but remain within the total budget.
-                node_memory = item.get("node_function_memory")
+                node_memory = item.get("node_evidence")
                 if node_memory and record["page_id"] != focus_id:
-                    item.pop("node_function_memory")
+                    item.pop("node_evidence")
                     continue
                 field = next((key for key in ("outcomes", "controls", "entry_path", "content_hints", "checklist", "states") if item[key]), None)
                 if field:
@@ -385,7 +374,7 @@ class GraphMemory:
                 elif item["state"]:
                     item["state"] = {}
                 elif node_memory:
-                    item.pop("node_function_memory")
+                    item.pop("node_evidence")
                 else:
                     result["pages"].pop()
                     break

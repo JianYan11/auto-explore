@@ -1,17 +1,22 @@
-"""Independent model summaries with bounded evidence, validation and revision caching."""
+"""Shared summary model adapter and optional per-node interpretation.
 
+App-level incremental summaries are owned by capabilities.AppCapabilityCatalog.
+Per-node summaries are retained for consumers needing exact state/input cases;
+the exploration loop does not start a second automatic summary pipeline.
+"""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 from pathlib import Path
-import time
 
 from .config import ExplorerConfig
-from .knowledge import derive_experiences, digest
+from .evidence import redact_evidence_text, live_node_evidence
+from .knowledge import digest
+from .model_api import chat_request_options, completion_token_budget
 
-
-PROMPT_PATH = Path(__file__).parent / "prompts" / "experience_summary.md"
+NODE_PROMPT_PATH = Path(__file__).parent / "prompts" / "node_function_memory.md"
 
 
 def model_identity(name: str) -> str:
@@ -35,100 +40,6 @@ def validate_summary_config(config: ExplorerConfig) -> None:
         raise ValueError("Experience summary model must differ from execution --model")
 
 
-def evidence_revision(experience: dict, model: str, prompt: str) -> str:
-    raw = {key: value for key, value in experience.items() if key != "model_summary"}
-    return digest([model, digest(prompt), raw])
-
-
-def _clip(value: object) -> object:
-    if isinstance(value, str):
-        return value[:240]
-    if isinstance(value, list):
-        return [_clip(item) for item in value[:12]]
-    if isinstance(value, dict):
-        return {str(key)[:80]: _clip(item) for key, item in list(value.items())[:16]}
-    return value
-
-
-def build_summary_evidence(experience: dict, observations: list[dict], config: ExplorerConfig) -> dict:
-    available = {obs["observation_id"]: obs for obs in observations}
-    classes = [experience[key] for key in ("support_ids", "counterexample_ids", "unresolved_ids")]
-    mandatory = list(dict.fromkeys(ids[-1] for ids in classes if ids))
-    all_ids = list(dict.fromkeys(oid for ids in classes for oid in ids))
-    selected = list(dict.fromkeys(mandatory + list(reversed(all_ids))))[:8]
-    payload = {
-        "experience_id": experience["experience_id"],
-        "app_package": config.app_package, "memory_scope": config.memory_scope,
-        "source": _clip(experience["source"]), "action": _clip(experience["action"]),
-        "conditions": _clip(experience["conditions"]), "evidence_status": experience["status"],
-        "support_count": experience["support_count"],
-        "counterexample_count": experience["counterexample_count"],
-        "outcome_counts": experience["outcome_counts"], "observations": [],
-        "text_may_be_truncated": True, "evidence_sample_truncated": len(selected) < len(all_ids),
-        "description_origin": "execution_model; no independent screenshot inspection",
-    }
-    for oid in selected:
-        obs = available.get(oid)
-        if obs is None:
-            raise ValueError("Referenced observation is unavailable")
-        record = {"observation_id": oid, "evidence_class": next(
-            label for label, ids in zip(("support", "counterexample", "unresolved"), classes) if oid in ids),
-            **{key: _clip(obs.get(key)) for key in (
-                "outcome", "execution_success", "observation_valid", "destination_verified",
-                "business_success", "target", "error_stage", "recovery",
-            )}}
-        payload["observations"].append(record)
-        if len(json.dumps(payload, ensure_ascii=False)) > config.summary_max_chars:
-            payload["observations"].pop()
-            payload["evidence_sample_truncated"] = True
-            if oid in mandatory:
-                raise ValueError("Required evidence exceeds summary input budget")
-            break
-    return payload
-
-
-def validate_summary_result(response: object, payload: dict) -> dict:
-    fields = {"experience_id", "summary", "applicability", "failure_interpretation",
-              "limitations", "hypotheses", "next_checks", "evidence_ids"}
-    if not isinstance(response, dict) or set(response) != fields:
-        raise ValueError("Summary must match the exact JSON schema")
-    if response["experience_id"] != payload["experience_id"]:
-        raise ValueError("Summary experience_id does not match evidence")
-    allowed = {obs["observation_id"] for obs in payload["observations"]}
-
-    def text(value, limit):
-        if not isinstance(value, str) or not value.strip() or len(value) > limit:
-            raise ValueError("Invalid or oversized summary text")
-
-    def citations(value):
-        if (not isinstance(value, list) or not 1 <= len(value) <= 8
-                or not all(isinstance(oid, str) and oid in allowed for oid in value)
-                or len(set(value)) != len(value)):
-            raise ValueError("Summary cites missing, duplicate or unsupplied evidence")
-
-    for key in ("summary", "applicability", "failure_interpretation", "limitations"):
-        text(response[key], 900 if key == "summary" else 400)
-    citations(response["evidence_ids"])
-    for group, limit, keys in (("hypotheses", 2, ("claim",)),
-                              ("next_checks", 3, ("question", "expected_information"))):
-        values = response[group]
-        if not isinstance(values, list) or len(values) > limit:
-            raise ValueError("Too many summary hypotheses/checks")
-        for item in values:
-            if not isinstance(item, dict) or set(item) != set(keys) | {"evidence_ids"}:
-                raise ValueError("Invalid summary hypothesis/check")
-            for key in keys:
-                text(item[key], 200)
-            citations(item["evidence_ids"])
-    for evidence_class in ("support", "counterexample", "unresolved"):
-        ids = {obs["observation_id"] for obs in payload["observations"] if obs["evidence_class"] == evidence_class}
-        if ids and not ids.intersection(response["evidence_ids"]):
-            raise ValueError(f"Summary omitted {evidence_class} evidence")
-    if len(json.dumps(response, ensure_ascii=False)) > 5000:
-        raise ValueError("Summary exceeds output budget")
-    return response
-
-
 class ExperienceSummaryClient:
     """Independent model/session on the execution API service authorized by the user."""
 
@@ -141,6 +52,11 @@ class ExperienceSummaryClient:
             raise ValueError("Missing experience summary API key")
         from openai import OpenAI
         self.model = config.summary_model.strip()
+        self.profile = config.model_api_profile
+        self.request_options = chat_request_options(
+            self.model, profile=config.model_api_profile,
+            reasoning_effort=config.model_reasoning_effort,
+        )
         self.client = OpenAI(base_url=config.vlm_base_url, api_key=key,
                              timeout=config.summary_timeout, max_retries=0)
 
@@ -151,7 +67,8 @@ class ExperienceSummaryClient:
             model=self.model,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": json.dumps(evidence, ensure_ascii=False)}],
-            temperature=0, max_tokens=4096 if is_catalog else 1800,
+            max_tokens=completion_token_budget(self.model, 4096 if is_catalog else 1800, profile=self.profile),
+            **self.request_options,
             **options,
         )
         choice = response.choices[0]
@@ -164,61 +81,170 @@ class ExperienceSummaryClient:
         return json.loads(raw)
 
 
-class ExperienceSummaryService:
-    def __init__(self, config: ExplorerConfig, state, client=None):
-        validate_summary_config(config)
-        self.config, self.state = config, state
-        self.model = config.summary_model.strip()
-        self.client = client if client is not None else ExperienceSummaryClient(config)
-        if getattr(self.client, "model", None) != self.model:
-            raise ValueError("Injected summary client model must match --summary-model")
-        self.prompt = PROMPT_PATH.read_text(encoding="utf-8")
-        self.prompt_revision = digest(self.prompt)
-        self.log_path = state.run_dir / "experience_summaries.jsonl"
-        self.cache: dict[str, dict] = {}
+def validate_node_summary(response: object, payload: dict) -> dict:
+    if not isinstance(response, dict) or set(response) != {"node_id", "page_role", "functions"}:
+        raise ValueError("Invalid node summary schema")
+    if response["node_id"] != payload["node_id"]:
+        raise ValueError("Wrong node summary identity")
 
-    def lookup(self, experience: dict) -> dict | None:
-        cached = self.cache.get(experience["experience_id"])
-        revision = evidence_revision(experience, self.model, self.prompt)
-        return cached["result"] if cached and cached["revision"] == revision else None
+    def prose(value, limit):
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            raise ValueError("Invalid node summary text")
+        return redact_evidence_text(value, limit)
 
-    def summarize(self, experience: dict) -> dict | None:
-        revision = evidence_revision(experience, self.model, self.prompt)
-        previous = self.cache.get(experience["experience_id"])
-        if previous and previous["revision"] == revision:
-            return previous["result"]  # Also cache failure until evidence changes.
-        record = {"experience_id": experience["experience_id"], "evidence_revision": revision,
-                  "model": self.model, "execution_model": self.config.model,
-                  "prompt_revision": self.prompt_revision, "timestamp": time.time(), "status": "failed"}
-        result = None
-        try:
-            payload = build_summary_evidence(
-                experience, self.state.historical_observations + self.state.graph.observations, self.config,
-            )
-            record["evidence"] = payload
-            response = self.client.summarize(self.prompt, payload)
-            record["response"] = response
-            validated = validate_summary_result(response, payload)
-            result = {**validated, "model": self.model, "evidence_revision": revision,
-                      "prompt_revision": self.prompt_revision, "advisory_only": True}
-            record["status"] = "accepted"
-        except Exception as exc:
-            message = str(exc)
-            for secret in (self.config.summary_api_key, self.config.vlm_api_key):
-                if secret:
-                    message = message.replace(secret, "[redacted]")
-            record["error"] = f"{type(exc).__name__}: {message[:500]}"
-            print(f"[Summary] 经验总结未采用（{type(exc).__name__}），保留原始证据与规则统计")
-        self.cache[experience["experience_id"]] = {"revision": revision, "result": result}
-        with self.log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    role = prose(response["page_role"], 200)
+    values = response["functions"]
+    expected = {unit["unit_id"]: unit for unit in payload["units"]}
+    if not isinstance(values, list) or len(values) != len(expected):
+        raise ValueError("Each supplied UI case needs a summary")
+    results = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, dict) or set(item) != {
+            "unit_id", "function", "observed_effect", "applicability", "limitations", "evidence_ids",
+        }:
+            raise ValueError("Unexpected node function fields")
+        uid = item["unit_id"]
+        if not isinstance(uid, str) or uid not in expected or uid in seen:
+            raise ValueError("Unknown or duplicate UI case")
+        seen.add(uid)
+        unit = expected[uid]
+        ids = item["evidence_ids"]
+        if (not isinstance(ids, list) or len(ids) > 16
+                or any(not isinstance(oid, str) or oid not in unit["evidence_ids"] for oid in ids)
+                or len(set(ids)) != len(ids)):
+            raise ValueError("Citation belongs to another UI/state or is unknown")
+        # Every supplied effect/error/recovery variant must remain represented.
+        if any(not set(ids).intersection(outcome["evidence_ids"]) for outcome in unit["outcomes"]):
+            raise ValueError("Node summary omitted an observed variant")
+        results.append({"unit_id": uid, "function": prose(item["function"], 160),
+                        "observed_effect": prose(item["observed_effect"], 400),
+                        "applicability": prose(item["applicability"], 240),
+                        "limitations": prose(item["limitations"], 240), "evidence_ids": ids})
+    return {"node_id": payload["node_id"], "page_role": role, "functions": results}
+
+
+class NodeFunctionMemory:
+    """One versioned memory per node. Saving and lookup never call a model."""
+
+    def __init__(self, config, state, client=None):
+        self.config, self.state, self.client = config, state, client
+        if client is not None and (not config.summary_model.strip()
+                                   or getattr(client, "model", None) != config.summary_model.strip()):
+            raise ValueError("Node memory must use the configured summary model")
+        self.prompt = NODE_PROMPT_PATH.read_text(encoding="utf-8")
+        self.cache = {}
+        self.log_path = state.run_dir / "node_function_summaries.jsonl"
+
+    def _revision(self, evidence):
+        return digest([evidence, self.config.summary_model, self.prompt])
+
+    def _packet(self, evidence, units):
+        controls = {item["function_id"]: item for item in evidence["functions"]}
+        selected = []
+        for unit in units:
+            item = deepcopy(unit)
+            item["control"] = controls[item["function_id"]]["control"]
+            # Keep at least one reference for EVERY distinct effect and failure.
+            # If that set does not fit, fail this case rather than hide a branch.
+            for outcome in item["outcomes"]:
+                outcome["evidence_ids"] = outcome["evidence_ids"][-1:]
+                outcome["target_state_ids"] = outcome["target_state_ids"][-2:]
+            item["evidence_ids"] = [oid for o in item["outcomes"] for oid in o["evidence_ids"]]
+            item["source_state_ids"] = item["source_state_ids"][-2:]
+            selected.append(item)
+        return {key: evidence[key] for key in ("task", "node_id", "page_id", "page_description")} | {
+            "app_package": redact_evidence_text(evidence["app_package"]), "memory_scope": redact_evidence_text(evidence["memory_scope"]),
+            "units": selected, "partial_node": len(units) < len(evidence["units"]),
+            "descriptions_from_execution_model": True, "input_values_omitted": True,
+            "business_success": "unknown",
+        }
+
+    def summarize(self, evidence: dict) -> dict:
+        revision = self._revision(evidence)
+        previous = self.cache.get(evidence["node_id"])
+        if self.client is None or (previous and previous["revision"] == revision):
+            return self.snapshot(evidence)
+        cached = {"revision": revision, "summaries": {}, "roles": [], "failed_units": []}
+        # Publish the empty revision before any call so failure cannot leave old prose.
+        self.cache[evidence["node_id"]] = cached
+        remaining = list(evidence["units"])
+        while remaining:
+            batch = [remaining.pop(0)]
+            while remaining and len(batch) < 3:
+                candidate = self._packet(evidence, batch + [remaining[0]])
+                if len(json.dumps(candidate, ensure_ascii=False)) > self.config.summary_max_chars:
+                    break
+                batch.append(remaining.pop(0))
+            event = {"node_id": evidence["node_id"], "evidence_revision": revision,
+                     "model": self.config.summary_model, "unit_ids": [u["unit_id"] for u in batch],
+                     "status": "failed"}
+            try:
+                payload = self._packet(evidence, batch)
+                if (len(json.dumps(payload, ensure_ascii=False)) > self.config.summary_max_chars
+                        or any(len(u["evidence_ids"]) > 16 for u in payload["units"])):
+                    raise ValueError("Node evidence exceeds input/citation budget")
+                response = self.client.summarize(self.prompt, payload)
+                result = validate_node_summary(response, payload)
+                cached["summaries"].update({item["unit_id"]: item for item in result["functions"]})
+                cached["roles"].append({"page_role": result["page_role"], "unit_ids": event["unit_ids"]})
+                event["status"] = "accepted"
+            except Exception as exc:
+                cached["failed_units"].extend(event["unit_ids"])
+                event["error_type"] = type(exc).__name__
+                print(f"[Node memory] 节点功能总结未采用（{type(exc).__name__}），保留 UI 操作证据")
+            # No raw model response, input values or exception messages in this log.
+            with self.log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return self.snapshot(evidence)
+
+    def summarize_page(self, page_id):
+        page_id = self.state.resolve_page_id(page_id)
+        page = self.state.graph.pages.get(page_id)
+        if page is not None:
+            return self.summarize(live_node_evidence(self.state.graph, page))
+
+    def snapshot(self, evidence):
+        revision = self._revision(evidence)
+        cached = self.cache.get(evidence["node_id"])
+        cached = cached if cached and cached["revision"] == revision else None
+        units = {unit["unit_id"]: unit for unit in evidence["units"]}
+        result = {key: evidence[key] for key in ("schema_version", "node_id", "page_id", "coverage_complete", "business_success")}
+        result.update({"evidence_revision": revision, "model": self.config.summary_model.strip() or None,
+                       "advisory_only": True, "page_roles": deepcopy(cached["roles"]) if cached else [],
+                       "functions": [], "summary_status": "disabled" if self.client is None else
+                       "empty" if not units else "pending" if cached is None else
+                       "partial" if cached["failed_units"] and cached["summaries"] else
+                       "unavailable" if cached["failed_units"] else "accepted"})
+        for function in evidence["functions"]:
+            item = deepcopy(function)
+            item["cases"] = [deepcopy(units[uid]) for uid in item.pop("case_ids")]
+            for case in item["cases"]:
+                summary = cached["summaries"].get(case["unit_id"]) if cached else None
+                if summary is not None:
+                    case["model_summary"] = deepcopy(summary)
+            result["functions"].append(item)
         return result
 
-    def summarize_latest(self) -> None:
-        if not self.state.graph.observations:
-            return
-        latest = self.state.graph.observations[-1]["observation_id"]
-        for experience in derive_experiences(self.state.historical_observations + self.state.graph.observations):
-            if any(latest in experience[key] for key in ("support_ids", "counterexample_ids", "unresolved_ids")):
-                self.summarize(experience)
-                return
+    def snapshot_page(self, page):
+        return self.snapshot(live_node_evidence(self.state.graph, page))
+
+    def context(self, evidence, *, historical=False, max_chars=2200):
+        memory = self.summarize(evidence) if historical else self.snapshot(evidence)
+        result = {key: memory[key] for key in ("node_id", "page_id", "summary_status", "advisory_only")}
+        result.update({"historical": historical, "functions": [], "truncated": False})
+        for function in memory["functions"]:
+            for case in function["cases"]:
+                item = {"function_id": function["function_id"], "element_id": function["element_id"],
+                        "control": function["control"], "unit_id": case["unit_id"],
+                        "source_state": case["source_state"], "action": case["action"],
+                        "conditions": case["conditions"],
+                        "status": case["status"], "attempt_count": case["attempt_count"],
+                        "outcome_counts": case["outcome_counts"]}
+                if "model_summary" in case:
+                    item["model_summary"] = case["model_summary"]
+                result["functions"].append(item)
+                if len(json.dumps(result, ensure_ascii=False)) > max_chars:
+                    result["functions"].pop()
+                    result["truncated"] = True
+        return result

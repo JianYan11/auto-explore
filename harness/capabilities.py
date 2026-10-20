@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import time
 
-from .evidence import evidence_quality
+from .evidence import evidence_quality, sanitize_inventory
 from .knowledge import digest
 from .summary import ExperienceSummaryClient
 from .summary_format import SummaryBudgetExceeded, summarize_validated, validate_text
@@ -163,7 +163,8 @@ class AppCapabilityCatalog:
                     "state": _state(record.get("state")), "controls": [{"type": _text(e.get("type"), 40),
                     "label": _text(e.get("label"), 70), "description": _text(e.get("description"), 100)} for e in controls[:24]],
                     "controls_truncated": bool(record.get("controls_truncated")) or len(controls) > 24,
-                    "action_families": [_text(x) for x in (record.get("action_families") or [])[:16] if isinstance(x, str)]}
+                    "action_families": [_text(x) for x in (record.get("action_families") or [])[:16] if isinstance(x, str)],
+                    "content_inventory": sanitize_inventory(record.get("content_inventory"))}
             if record["evidence_id"] not in self.seen:
                 self._add(record["evidence_id"], data, deepcopy(refs[0]))
 
@@ -180,6 +181,7 @@ class AppCapabilityCatalog:
         data = {"kind": "surface", "module": _text(work.get("module") or page.get("page_description")),
                 "description": _text(page.get("page_description") or page.get("page_type")),
                 "state": _state(raw_state), "controls": controls, "controls_truncated": len(elements) > 24,
+                "content_inventory": sanitize_inventory(page.get("content_inventory")),
                 "action_families": sorted({a.get("action_family") for a in work.get("planned_actions", []) if a.get("action_family")})[:16]}
         # The evidence key includes the structural contents, so late controls are not lost.
         eid = "surface_" + digest([run, pid, wid, data])
@@ -195,6 +197,7 @@ class AppCapabilityCatalog:
                            "pages": {key: {"page_description": page.page_description, "page_type": page.page_type,
                                             "activity": page.activity,
                                             "semantic_state": page.semantic_state, "screenshot_path": page.screenshot_path,
+                                            "content_inventory": page.content_inventory,
                                             "states": {sid: {"screenshot_path": visual.screenshot_path} for sid, visual in page.states.items()},
                                             "elements": [asdict(element) for element in page.elements]} for key, page in graph.pages.items()},
                            "work_items": {key: asdict(work) for key, work in graph.work_items.items()},

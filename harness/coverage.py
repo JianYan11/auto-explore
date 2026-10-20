@@ -264,10 +264,10 @@ class CoverageCheckpoint:
                     query=" ".join(item["page_description"] for item in candidates), purpose="schedule",
                 )
                 for candidate in candidates:
-                    candidate["node_function_memory"] = next((
-                        page["node_function_memory"] for page in context["pages"]
+                    candidate["node_evidence"] = next((
+                        page["node_evidence"] for page in context["pages"]
                         if page["source"] == "live" and page["page_id"] == candidate["node_id"]
-                        and "node_function_memory" in page
+                        and "node_evidence" in page
                     ), None)
                     candidate["relevant_experiences"] = [
                         item for item in context["experiences"]

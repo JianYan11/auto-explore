@@ -8,16 +8,18 @@ from typing import Optional, Sequence
 
 from .config import QWEN_RESIZE_FACTOR, ExplorerConfig
 from .loop import AndroidExplorer
+from .model_api import chat_request_options
 from .summary import validate_summary_config
 from .terminal_log import capture_terminal_output
+from runtime_config import default_adb
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="通过 adb 探索 Android app 并生成页面图谱")
-    parser.add_argument("--package", required=True, help="App package name")
+    parser.add_argument("--package", required=True, help="App package name") ##这里输入了要探索的app
     parser.add_argument("--activity", default="", help="Main activity；不传则用 monkey 启动")
-    parser.add_argument("--device", default=ExplorerConfig.device_name, help="ADB device serial")
-    parser.add_argument("--adb", default=ExplorerConfig.adb_path, help="adb 可执行文件路径")
+    parser.add_argument("--device", default=ExplorerConfig().device_name, help="云沙箱的 ADB serial；也可设置 ANDROID_SERIAL")
+    parser.add_argument("--adb", default=default_adb(), help="adb 可执行文件路径")
     parser.add_argument("--max-pages", type=int, default=ExplorerConfig.max_pages, help="最大页面数")
     parser.add_argument("--max-depth", type=int, default=ExplorerConfig.max_depth, help="最大探索深度")
     parser.add_argument("--max-steps", type=int, default=ExplorerConfig.max_steps,
@@ -128,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> ExplorerConfig:
+    if not args.device.strip():
+        parser.error("请通过 --device 或 ANDROID_SERIAL 指定云沙箱的 ADB serial")
     if args.max_pages < 1:
         parser.error("--max-pages 必须大于 0")
     for name in ("max_states_per_page", "max_actions_per_state", "continuous_steps", "max_transition_repeats", "max_replay_steps"):
@@ -219,6 +223,8 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if args.summary_api_key is not None:
         config.summary_api_key = args.summary_api_key
     try:
+        chat_request_options(config.model, profile=config.model_api_profile,
+                             reasoning_effort=config.model_reasoning_effort)
         validate_summary_config(config)
     except ValueError as exc:
         parser.error(str(exc))

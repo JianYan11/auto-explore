@@ -1,46 +1,30 @@
-"""Incremental App structure inventory and synthetic-only replica fixtures.
+"""Optional structural profile and synthetic replica fixtures.
 
-The export boundary accepts enum tokens only. No captured names, values, free-form
-model prose, screenshots, or reversible identity maps enter the profile artifacts.
+This separate product is not invoked by cloud exploration. Captured field values
+never enter its enum-only exports. Core observation sanitization lives in evidence.
 """
-
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
+from .evidence import sanitize_inventory
 from .knowledge import digest
 
 
-FEATURES = (
-    "browse_catalog", "search", "filter", "sort", "view_details", "favorites",
-    "cart", "checkout", "order_history", "reviews", "media_playback", "playlist",
-    "messaging", "contacts", "social_feed", "compose", "calendar", "maps",
-    "booking", "notifications", "account", "settings", "authentication", "payments",
-    "files", "notes", "health_tracking", "learning", "weather",
-)
-ROLES = ("home", "list", "detail", "form", "search_results", "empty", "error",
-         "loading", "dialog", "menu", "settings", "profile", "chat", "player", "map", "calendar")
-KINDS = (
-    "product", "book", "article", "video", "song", "album", "playlist", "podcast",
-    "course", "lesson", "place", "restaurant", "event", "booking", "order",
-    "review", "post", "comment", "contact", "conversation", "message", "notification",
-    "account", "transaction", "file", "note", "health_record", "weather_report", "generic_item",
-)
-FIELDS = (
-    "id", "title", "subtitle", "description", "category", "price", "rating", "count",
-    "author", "artist", "duration", "cover", "name", "phone", "email", "address",
-    "account_id", "order_id", "amount", "message", "timestamp", "status", "location",
-    "latitude", "longitude", "health_note", "password", "verification_code", "balance",
-    "quantity", "date", "size", "file_type", "is_favorite", "is_read",
-)
 PERSONAL_FIELDS = frozenset({
     "name", "phone", "email", "address", "account_id", "order_id", "amount", "message",
     "timestamp", "location", "latitude", "longitude", "health_note", "balance",
 })
+
+
 OMITTED_FIELDS = frozenset({"password", "verification_code"})
+
+
 CATEGORIES = ("shopping", "reading", "news", "music", "video", "social", "messaging",
               "travel", "food", "productivity", "finance", "health", "education", "weather", "other")
+
+
 SCENARIOS = {
     "browse_to_detail": {"browse_catalog", "view_details"},
     "search_and_filter": {"search", "filter"},
@@ -53,54 +37,13 @@ SCENARIOS = {
     "read_content": {"view_details"},
     "empty_and_error_states": set(),
 }
+
+
 GAPS = ("detail_fields", "pagination", "empty_state", "error_state", "loading_state",
         "search_results", "filter_options", "relationships", "authentication_states", "return_navigation")
-VISIBILITIES = ("public", "personal", "unknown")
+
+
 PROMPT_PATH = Path(__file__).parent / "prompts" / "app_content_profile.md"
-
-
-def _tokens(value: object, allowed: tuple | frozenset, limit: int) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return sorted({item for item in value if isinstance(item, str) and item in allowed})[:limit]
-
-
-def sanitize_inventory(raw: object) -> dict:
-    """Drop all unknown text and values, including keys resembling allowed labels."""
-    if not isinstance(raw, dict):
-        return {"features": [], "screen_roles": [], "entities": []}
-    entities = {}
-    for item in raw.get("entities", [])[:8] if isinstance(raw.get("entities"), list) else []:
-        if not isinstance(item, dict) or item.get("kind") not in KINDS:
-            continue
-        visibility = item.get("visibility") if item.get("visibility") in VISIBILITIES else "unknown"
-        fields = _tokens(item.get("fields"), FIELDS, len(FIELDS))
-        entity = {"kind": item["kind"], "fields": fields, "visibility": visibility}
-        entities[digest(entity)] = entity
-    return {
-        "features": _tokens(raw.get("features"), FEATURES, len(FEATURES)),
-        "screen_roles": _tokens(raw.get("screen_roles"), ROLES, len(ROLES)),
-        "entities": sorted(entities.values(), key=lambda item: (item["kind"], item["visibility"], item["fields"])),
-    }
-
-
-def observation_instructions() -> str:
-    vocabulary = {"features": FEATURES, "screen_roles": ROLES, "entity_kinds": KINDS,
-                  "field_names": FIELDS, "visibility": VISIBILITIES}
-    return (
-        "\nAlso return content_inventory with features, screen_roles and entities. "
-        "Each entity has exactly kind, fields (field NAMES only) and visibility. "
-        "Use only exact tokens from the vocabulary below. Describe STRUCTURE actually visible "
-        "on this screen, including display-only content; this does not make it an action target. "
-        "Never put field values, real names, titles, messages, identifiers, phone numbers, addresses, "
-        "URLs, credentials, medical or financial details into content_inventory. No free-form text. "
-        "For private screens retain only generic entity types and field names, visibility=personal. "
-        "When uncertain use visibility=unknown; do not infer hidden features. "
-        "Return empty arrays when no supported structure is visible. Example: "
-        '{"features":["browse_catalog"],"screen_roles":["list"],"entities":'
-        '[{"kind":"book","fields":["title","author"],"visibility":"public"}]}. '
-        "Vocabulary: " + json.dumps(vocabulary, ensure_ascii=False)
-    )
 
 
 def synthetic_value(kind: str, field: str, index: int):
