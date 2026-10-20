@@ -23,6 +23,7 @@ from .config import (
 )
 from .context import HASH_PROMPT, PAGE_DESCRIPTION_PROMPT, ExplorationContextBuilder
 from .contracts import ActionSequenceStep, ExplorationAction, InputFieldObservation, ScreenCapture
+from .model_api import chat_request_options, completion_token_budget
 from .visual import perceptual_hash_png
 
 
@@ -131,6 +132,10 @@ class VLMAnalyzer:
             timeout=config.vlm_timeout,
         )
         self.model = config.model
+        self.request_options = chat_request_options(
+            self.model, profile=config.model_api_profile,
+            reasoning_effort=config.model_reasoning_effort,
+        )
         self.max_image_side = config.vlm_max_image_side
         self.context_builder = context_builder or ExplorationContextBuilder()
         self.last_comparison: Dict[str, Any] = {}
@@ -427,12 +432,14 @@ class VLMAnalyzer:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": content}],
-            max_tokens=max_tokens,
-            temperature=0,
-            extra_body={"enable_thinking": False},
+            max_tokens=completion_token_budget(self.model, max_tokens, profile=self.config.model_api_profile),
+            **self.request_options,
         )
-        message = response.choices[0].message
-        response_content = message.content or getattr(message, "reasoning_content", None) or ""
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise ValueError("VLM response exceeded its token budget; no complete JSON result")
+        # Reasoning is not a completed answer and must never become an action.
+        response_content = choice.message.content or ""
         parsed = self._parse_json_response(response_content)
         if isinstance(parsed, list):
             parsed = {"elements": parsed}
@@ -641,11 +648,13 @@ class AndroidController:
     """ADB-backed Android device tool."""
 
     def __init__(self, config: ExplorerConfig):
-        self.config = config
+        self.config = config ##这里的config是一个ExplorerConfig的实例
 
     def connect(self) -> None:
         self._run_adb(["start-server"], include_device=False)
+        ##这里是启动了adb
         state = self._adb("get-state", check=False).strip()
+
         if state != "device":
             devices = self._run_adb(["devices"], include_device=False, check=False).strip()
             raise RuntimeError(

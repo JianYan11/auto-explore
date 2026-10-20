@@ -18,7 +18,7 @@ from typing import Deque, Dict, Set, Tuple
 
 from .actions import ActionCodec
 from .config import ExplorerConfig
-from .content_profile import sanitize_inventory
+from .evidence import sanitize_inventory
 from .contracts import (ActionSequenceStep, AppGraph, ExplorationAction, PageState,
                         PageVisualState, ScreenCapture, Transition, UIElement)
 from .knowledge import (action_descriptor, action_key, classify_outcome, derive_experiences,
@@ -68,9 +68,6 @@ class ExplorationState:
             "source_revision": self.source_revision, "config": self.effective_config}, indent=2), encoding="utf-8")
         self.observation_log_path = self.run_dir / "observations.jsonl"
         self.historical_observations: list[dict] = []
-        self.summary_service = None
-        self.content_profile = None
-        self.node_function_service = None
         self.capability_service = None
         self.vlm_comparison_counter = 0
         self.vlm_comparison_log_path = Path(config.output_dir) / "vlm_comparisons.jsonl"
@@ -579,13 +576,7 @@ class ExplorationState:
         return True
 
     def experiences(self) -> list[dict]:
-        experiences = derive_experiences(self.historical_observations + self.graph.observations)
-        if self.summary_service:
-            for experience in experiences:
-                summary = self.summary_service.lookup(experience)
-                if summary is not None:
-                    experience["model_summary"] = summary
-        return experiences
+        return derive_experiences(self.historical_observations + self.graph.observations)
 
     def save_graph(self, *, announce: bool = True) -> None:
         output_path = Path(self.config.output_dir) / "app_graph.json"
@@ -613,11 +604,8 @@ class ExplorationState:
                 "max_states_per_page", "max_actions_per_state", "continuous_steps", "max_transition_repeats")},
             "model_roles": {"execution": self.config.model,
                             "experience_summary": self.config.summary_model.strip() or None},
-            "summary_kind": "app_capabilities" if self.capability_service else "legacy",
+            "summary_kind": "app_capabilities" if self.capability_service else "evidence_only",
             "app_capabilities": self.capability_service.snapshot() if self.capability_service else None,
-            "experience_summary_log": str(self.summary_service.log_path) if self.summary_service else None,
-            "content_profile": self.content_profile.snapshot() if self.content_profile else None,
-            "node_function_summary_log": str(self.node_function_service.log_path) if self.node_function_service else None,
             "run_id": self.graph.run_id,
             "memory_scope": self.config.memory_scope,
             "observation_log": str(self.observation_log_path),
@@ -659,8 +647,6 @@ class ExplorationState:
                     "content_hints": page.content_hints,
                     "content_inventory": sanitize_inventory(page.content_inventory),
                     "control_aliases": page.control_aliases,
-                    "node_function_memory": (self.node_function_service.snapshot_page(page)
-                                             if self.node_function_service else None),
                     "description_embedding": page.description_embedding,
                     "embedding_model": page.embedding_model,
                     "semantic_error": page.semantic_error,
@@ -713,8 +699,6 @@ class ExplorationState:
             (self.run_dir / "state_graph.json").write_text(state_encoded, encoding="utf-8")
         for log_path in (self.vlm_comparison_log_path, self.coverage_checkpoint_log_path, self.memory_planning_log_path):
             shutil.copyfile(log_path, self.run_dir / log_path.name)
-        if self.content_profile:
-            self.content_profile.save()
         if self.capability_service:
             self.capability_service.save()
         if announce:

@@ -7,6 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from runtime_config import load_environment
+
+load_environment()
+
 from harness.capabilities import AppCapabilityCatalog
 from harness.config import ExplorerConfig
 from harness.contracts import AppGraph
