@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from runtime_config import default_adb
+
 
 def _first_env(*names: str, default: str = "") -> str:
     for name in names:
@@ -35,14 +37,8 @@ class ExplorerConfig:
     """Runtime configuration for one exploration run."""
 
     # ADB settings
-    adb_path: str = _first_env(
-        "ADB_PATH",
-        default="D:\\Android\\SDK\\platform-tools\\adb.exe",
-    )
-    device_name: str = _first_env("ANDROID_SERIAL", 
-                                  default="emulator-5554"
-                                #   default="96234697" 
-    )
+    adb_path: str = field(default_factory=default_adb)
+    device_name: str = field(default_factory=lambda: _first_env("ANDROID_SERIAL"))
     adb_timeout: float = 30.0
 
     # App settings
@@ -69,7 +65,7 @@ class ExplorerConfig:
     memory_scope: str = ""  # Optional App version / test environment identifier.
     verification_retries: int = 1  # Bounded revisits of unresolved actions, within page/step budgets.
     # Empty summary_model preserves deterministic evidence memory without an LLM summary.
-    summary_model: str = _first_env("SUMMARY_MODEL", default = "Pro/moonshotai/Kimi-K2.6")
+    summary_model: str = os.getenv("SUMMARY_MODEL", "")
     summary_api_key: str = field(default_factory=lambda: _first_env("SUMMARY_API_KEY"), repr=False)
     summary_timeout: float = 1000
     summary_budget_seconds: float = 120.0
@@ -87,19 +83,22 @@ class ExplorerConfig:
 
     # VLM settings
     vlm_base_url: str = _first_env(
+        "MODEL_BASE_URL",
         "QWEN_BASE_URL",
         "MODELSCOPE_BASE_URL",
-        "OPENAI_BASE_URL", 
-        # default="https://www.cctq.ai/v1",
-        default="https://api.siliconflow.cn/v1",
+        "OPENAI_BASE_URL",
+        default="https://open.bigmodel.cn/api/paas/v4/",
     )
     # Deliberately no source-code fallback: credentials must be injected.
     vlm_api_key: str = _first_env(
+        "MODEL_API_KEY",
         "QWEN_API_KEY",
         "MODELSCOPE_API_KEY",
         "OPENAI_API_KEY",
     )
-    model: str = _first_env("QWEN_MODEL", default="Qwen/Qwen3.8-27B")
+    model: str = _first_env("MODEL_NAME", "QWEN_MODEL", default="glm-5.3-flash")
+    model_api_profile: str = _first_env("MODEL_API_PROFILE", default="auto")
+    model_reasoning_effort: str = _first_env("MODEL_REASONING_EFFORT", default="low")
     vlm_timeout: float = 1200.0
     vlm_max_image_side: int = 2048
     vlm_compare_max_attempts: int = 3

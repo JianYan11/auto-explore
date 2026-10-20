@@ -216,49 +216,97 @@ class StateExplorer:
             self.current.work = self.graph.work_items[self.registry.resolve(self.current.work.work_id)]
 
     def run(self, root_page, initial_capture):
+        ##这里出现了几个重要的参数 step（执行模型动作，如点击），burst，round
+
+        # 1. 用已有的启动截图分析根页面，建立当前视觉状态、状态工作项和空到达路径。
+        # observe() 内部会登记/复用工作项，并由 WorkRegistry 将可探索项加入队列。
+        # 此处使用传入的 initial_capture，不再额外截取一张屏幕。
         self.current = self.observe(root_page, initial_capture, [])
+
+        # 2. 保存本轮启动基线，并初始化连续动作计数。
+        # guard 包含状态、上下文和具体值等恢复证据，深拷贝避免随当前状态一起改变。
+        # burst 统计当前连续执行了多少步，不是已出队的节点数。
         self.graph.baseline = deepcopy(self.current.guard)
         burst = 0
+
+        # 3. 在总步数预算内循环；每轮最多执行一个被选中的候选动作。
+        # 这里不是“每轮取一个节点并把它完整探索完”，状态选择交给 pick()。
         while not self.explorer._step_budget_exhausted():
+            # 3.1 优先在当前实际界面上连续探索；达到连续步数边界后再轮转队列。
+            # pick() 的普通队列分支才会 pop(0) 取队首，并在需要时恢复到该状态。
+            # 活跃草稿还可在边界后额外借用最多两步提交/返回动作。
             choice = self.pick(burst)
             if choice is None:
+                # 没有可用工作，或无法返回目标 App 时退出；最终原因在循环后汇总。
                 break
             work, candidates = choice
+
+            # 3.2 从队列分支选中工作时，开始一段新的连续探索。
+            # take() 将该工作从待处理队列移除、标记 exploring，并记录调度顺序。
             if self.rotated:
                 burst = 0
             self.registry.take(work)
             self.round_pages.add(work.page_id)
+
+            # 3.3 从候选中选择并尝试一个动作，观察结果、记录证据和功能覆盖。
+            # step() 通过 observe() 登记/复用后继状态，并按可探索条件加入队尾；
+            # 后继也会成为 self.current，因此下轮可能直接继续它，无需等待队列轮转。
+            # 返回值表示是否得到可识别的后继位置，不等于操作或业务一定成功。
             if not self.step(work, candidates):
+                # 没有可继续的后继时，结束本轮总结，并重置连续动作计数。
                 self.finish_round()
                 burst = 0
             else:
+                # 有后继则累计连续步数；到边界时触发轮次总结。
+                # finish_round() 本身不切换状态，下一次 pick() 决定是否轮转。
                 burst += 1
                 if burst >= self.config.continuous_steps:
                     self.finish_round()
+
+            # 3.4 将各状态工作项的进度汇总到页面层，并保存当前图谱快照。
             self.update_page_summaries()
             self.state.save_graph(announce=False)
+
+            # 3.5 达到周期检查步数时，审计图谱、核验重复页面并选择后续工作。
+            # 页面/工作项合并可能改变 ID，因此检查后先刷新当前对象的别名引用。
             if self.explorer.coverage_checkpoint.should_run(self.graph.completed_steps):
                 current_id = self.current.work.work_id if self.current and self.current.work else work.work_id
                 chosen = self.explorer.coverage_checkpoint.run_work_checkpoint(current_id)
                 self.refresh_current_aliases()
+
+                # 检查点选中了其他工作时，尝试恢复到它；恢复成败由 restore() 记录。
+                # 检查点可以调整调度目标，所以整体探索顺序不保证严格 FIFO。
                 if chosen and (not self.current or not self.current.work or chosen != self.current.work.work_id):
                     self.restore(self.graph.work_items[self.registry.resolve(chosen)])
                 self.finish_round()
                 burst = 0
+
+        # 4. 循环结束后结算全部工作：刷新完成/阻塞等状态。
+        # 若总预算已耗尽且仍有候选动作，将相应工作标记为预算受限，而不是完成。
         for work in self.graph.work_items.values():
             self.registry.settle(work)
             if self.explorer._step_budget_exhausted() and self.registry.candidates(work):
                 self.registry.limit(work, "max_steps")
+
+        # 5. 将队列 ID 解析到合并后的规范 ID，保持顺序去重，只保留待处理/探索中工作。
+        # 页面队列只是兼容旧接口的发现索引；本模式实际由 work_queue 调度。
         self.graph.work_queue[:] = [key for key in dict.fromkeys(self.registry.resolve(key) for key in self.graph.work_queue)
                                    if self.graph.work_items[key].status in {"pending", "exploring"}]
         self.update_page_summaries()
-        self.state.pending_pages.clear()  # Page queue is a compatibility discovery index only.
+        self.state.pending_pages.clear()
+
+        # 6. 汇总整轮终止原因，优先级依次为：
+        # 无法返回目标 App → 预算受限 → 存在未完成/未合并工作 → 探索队列耗尽。
+        # frontier_exhausted 只表示当前已知工作耗尽，不保证 App 的所有功能已覆盖。
         statuses = {w.status for w in self.graph.work_items.values()}
         page_limited = (self.graph.termination_reason == "budget_limited" or
                         any(page.exploration_status == "budget_limited" for page in self.graph.pages.values()))
         self.graph.termination_reason = ("blocked" if self.app_return_failed else
                                          "budget_limited" if "budget_limited" in statuses or page_limited else
                                          "blocked" if statuses - {"complete", "merged"} else "frontier_exhausted")
+
+        # 7. 保存结算后的状态，再处理本轮功能目录总结并清空轮次页面集合。
+        # 外层 AndroidExplorer.explore() 的 finally 还会执行最终总结和最终保存。
         self.state.save_graph(announce=False)
         self.finish_round()
 

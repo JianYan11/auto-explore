@@ -1,0 +1,50 @@
+[
+  {
+    "package": "org.tasks",
+    "timeout_seconds": 600,
+    "max_attempts": 1,
+    "options": {
+      "max_steps": 3,
+      "max_pages": 8,
+      "max_depth": 4,
+      "continuous_steps": 3,
+      "replay_attempts": 1,
+      "verification_retries": 0,
+      "screenshot_delay": 1,
+      "no_semantic_dedup": true,
+      "memory_scope": "cloud-sandbox"
+    }
+  },
+  {
+    "package": "net.gsantner.markor",
+    "timeout_seconds": 600,
+    "max_attempts": 1,
+    "options": {
+      "max_steps": 3,
+      "max_pages": 8,
+      "max_depth": 4,
+      "continuous_steps": 3,
+      "replay_attempts": 1,
+      "verification_retries": 0,
+      "screenshot_delay": 1,
+      "no_semantic_dedup": true,
+      "memory_scope": "cloud-sandbox"
+    }
+  },
+  {
+    "package": "com.simplemobiletools.draw.pro",
+    "timeout_seconds": 600,
+    "max_attempts": 1,
+    "options": {
+      "max_steps": 3,
+      "max_pages": 8,
+      "max_depth": 4,
+      "continuous_steps": 3,
+      "replay_attempts": 1,
+      "verification_retries": 0,
+      "screenshot_delay": 1,
+      "no_semantic_dedup": true,
+      "memory_scope": "cloud-sandbox"
+    }
+  }
+]
