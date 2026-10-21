@@ -1,4 +1,4 @@
-"""ADB adapter for connected cloud sandbox devices. Cloud lifecycle is external."""
+"""ADB readiness and App checks shared by managed and externally connected sandboxes."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Callable
 
 from .errors import EnvironmentFailure
 from .models import Assignment, positive_seconds
+from .ports import PreparedEnvironment
 
 
 class AdbEnvironmentManager:
@@ -33,7 +34,7 @@ class AdbEnvironmentManager:
             raise EnvironmentFailure(f"ADB {args[0]} exited {result.returncode}: {result.stderr.strip()[:1000]}")
         return result.stdout.strip()
 
-    def prepare(self, assignment: Assignment, deadline: float, check: Callable[[], None]) -> None:
+    def prepare(self, assignment: Assignment, deadline: float, check: Callable[[], None]) -> PreparedEnvironment:
         boot_deadline = min(deadline, time.monotonic() + self.boot_timeout)
         last_error = "Android is not booted"
         while time.monotonic() < boot_deadline:
@@ -62,6 +63,8 @@ class AdbEnvironmentManager:
             self._clear(assignment.device, assignment.spec.package,
                         timeout=max(0.01, min(self.command_timeout, deadline - time.monotonic())))
         check()
+
+        return PreparedEnvironment(assignment.device)
 
     def _clear(self, serial: str, package: str, *, timeout: float | None = None) -> None:
         if self._adb(serial, "shell", "pm", "clear", package, timeout=timeout) != "Success":

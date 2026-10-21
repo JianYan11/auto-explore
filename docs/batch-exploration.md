@@ -1,6 +1,6 @@
 # 单机多 App 并发探索
 
-这一版在现有 `explore_android_app.py` 外增加持久化任务队列、调度器、Worker 和已连接云沙箱的 ADB 环境管理。
+在现有 `explore_android_app.py` 外增加持久化任务队列、调度器、Worker 和云沙箱环境管理，支持自动创建实例及 ADB 连接，也支持已有连接。
 调度单位是一次完整的 App 探索；`harness/` 内部仍负责页面、状态、动作和恢复路径。
 
 ## 快速运行
@@ -16,12 +16,12 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-先通过 AGR 创建云沙箱实例并连接 ADB，用 `adb devices -l` 确认当前 serial。目标 App 必须事先安装到可能分配到的设备上。
-注册操作只登记设备，实际健康检查在执行任务前进行。
+推荐使用托管模式。先配置 AGR 凭据及一个 Android World 工具模板，目标 App 必须已在镜像中安装：
 
 ```bash
-python explore_batch.py env add --device 127.0.0.1:PORT_A
-python explore_batch.py env add --device 127.0.0.1:PORT_B
+python explore_batch.py enqueue examples/cloud_tasks.json
+python explore_batch.py run --tool-id sdt-YOUR_TOOL_ID --region ap-guangzhou --concurrency 2
+python explore_batch.py status
 ```
 
 复制 `examples/cloud_tasks.json` 并替换为实际包名。示例继承 `.env` 中的总结模型设置，保留图谱和探索证据；
@@ -29,7 +29,7 @@ python explore_batch.py env add --device 127.0.0.1:PORT_B
 
 ```bash
 python explore_batch.py enqueue examples/cloud_tasks.json
-python explore_batch.py run --concurrency 2 --adb /absolute/path/to/adb
+python explore_batch.py run --tool-id sdt-YOUR_TOOL_ID --concurrency 2 --adb /absolute/path/to/adb
 python explore_batch.py status
 ```
 
@@ -51,20 +51,17 @@ GLM-5.3 请求依据：[官方模型文档](https://docs.bigmodel.cn/cn/guide/mo
 `SUMMARY_MODEL=` 或未设置时不调用独立总结模型；填写模型名即可启用总结能力。
 
 `examples/cloud_tasks.json` 是三 App、每个 3 步的并发联调清单，关闭 embedding 语义检索，保留视觉判重和图谱，总结模型继承 `.env`。
-默认可分配到任意已注册设备；若填写 `devices`，请使用当前 ADB 隧道地址。重新连接时端口可能改变。所有 App 必须已安装。
+托管模式默认可分配到任意匹配工具的逻辑容量槽位，`devices` 留空。外部设备模式若填写 `devices`，使用当前 ADB 隧道地址，重新连接时端口可能改变。所有 App 必须已安装。
 
 ```bash
-python explore_batch.py --db output/glm-batch/queue.sqlite3 env add --device 127.0.0.1:50107
-python explore_batch.py --db output/glm-batch/queue.sqlite3 env add --device 127.0.0.1:50125
-python explore_batch.py --db output/glm-batch/queue.sqlite3 env add --device 127.0.0.1:50138
 python explore_batch.py --db output/glm-batch/queue.sqlite3 enqueue examples/cloud_tasks.json
-python explore_batch.py --db output/glm-batch/queue.sqlite3 run --concurrency 3 --adb "$PWD/.tools/platform-tools/adb"
+python explore_batch.py --db output/glm-batch/queue.sqlite3 run --tool-id sdt-YOUR_TOOL_ID \
+  --concurrency 3 --adb "$PWD/.tools/platform-tools/adb"
 python explore_batch.py --db output/glm-batch/queue.sqlite3 status
 ```
 
 同一清单每次 `enqueue` 都会创建新任务，不要为查询进度重复入队。
-云实例及 ADB 隧道由外部启动；队列排空后退出，常驻云实例继续保留。
-本版没有创建、销毁云实例或自动维护隧道的腾讯云适配器。
+托管模式每个 Attempt 自动创建独占实例、连接 ADB、探索、回收。队列排空后退出；即使使用常驻工具也显式释放实例。状态库保留资源记录，回收失败时运行 `env cleanup`。完整参数和故障处理见 [云沙箱指南](cloud-sandbox.md)。
 
 真实 GLM 联调中，10 步状态探索曾在 Draw 的状态恢复阶段停止为 `blocked`，
 同批 Tasks/Markor 长任务及 Draw 连续探索复测由操作者取消，诊断证据均保留。
@@ -75,9 +72,8 @@ python explore_batch.py --db output/glm-batch/queue.sqlite3 status
 自定义队列时，所有命令都把全局 `--db` 放在子命令之前：
 
 ```bash
-python explore_batch.py --db output/my-batch/queue.sqlite3 env add --device 127.0.0.1:PORT_A
 python explore_batch.py --db output/my-batch/queue.sqlite3 enqueue my-tasks.json
-python explore_batch.py --db output/my-batch/queue.sqlite3 run --concurrency 1 --adb adb
+python explore_batch.py --db output/my-batch/queue.sqlite3 run --tool-id sdt-YOUR_TOOL_ID --concurrency 1 --adb adb
 ```
 
 `run` 会处理已有队列和运行期间新入队的任务，队列排空后退出。它不是永久驻留服务。
@@ -110,7 +106,7 @@ python explore_batch.py --db output/my-batch/queue.sqlite3 run --concurrency 1 -
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `package` | 必填 | 目标 App 包名 |
-| `devices` | `[]` | 可使用的 serial；空列表表示任意已注册设备 |
+| `devices` | `[]` | 可使用的环境 ID；托管模式留空，外部设备模式可填 serial |
 | `priority` | `0` | 数字越大越先分配，同优先级按入队顺序 |
 | `timeout_seconds` | `1800` | 从 Worker 开始准备环境到探索结束的时间预算 |
 | `max_attempts` | `1` | 包括首次执行的自动尝试次数上限 |
@@ -151,6 +147,7 @@ Environment: available → busy → available
 ```text
 artifacts/<task_id>/<attempt_id>/
   assignment.json    # 不含密钥的任务配置
+  environment.json   # 稳定环境 ID、本次 InstanceId 和 ADB serial
   worker.log         # 探索子进程 stdout/stderr，包括初始化错误
   app_graph.json     # 原探索器产物
   runs/              # 原探索器的证据、截图与内部 run_id
@@ -188,14 +185,16 @@ python visualize_graph.py --report output/glm-smoke-20261020/verification.json \
 | --- | --- |
 | `0` | 队列已排空，状态库中没有失败或取消任务 |
 | `1` | 状态库中有失败或取消任务 |
-| `2` | 输入/运行错误，或待执行任务没有可用兼容环境 |
+| `2` | 输入/运行错误、没有可用兼容环境，或存在未回收云资源 |
 | `130` | 收到 SIGINT/SIGTERM，已停止本轮运行 |
 
-`run` 返回 JSON 包含任务和环境状态计数；详细记录用 `status` 查询。
+`run` 返回 JSON 包含任务、环境状态计数和 `cleanup_pending` 数量；详细记录用 `status` 查询。探索成功但回收失败仍保留成功图谱，同时以退出码 2 提示资源欠账。
 
 ## 环境策略与故障恢复
 
-默认 `restart` 策略在任务结束时 force-stop 目标 App，保留登录和 App 数据。
+托管模式为每次尝试创建全新实例，结束后删除；它不复用设备上的登录或数据，也不重置服务端账号状态。启动时先回收该数据库的遗留实例，或使用 `env cleanup` 显式重试。旧版队列会原地迁移，保留任务历史。
+
+下述 `restart` / `clear-data` 策略用于外部设备模式：不传 `--tool-id`，不设置 `CLOUD_SANDBOX_TOOL_ID`，通过 `env add` 登记已连接的云设备。默认 `restart` 策略在任务结束时 force-stop 目标 App，保留登录和 App 数据。
 它不承诺干净基线；重试可能看到上一轮修改过的数据。
 
 如果明确需要每次清空目标 App 的本地数据，可以登记：
@@ -205,7 +204,7 @@ python explore_batch.py env add --device 127.0.0.1:PORT_A --reset-policy clear-d
 ```
 
 该策略在任务前后执行 `pm clear <package>`，会删除目标 App 的本地登录和数据。
-它不会重置其他 App、系统设置、SD 卡或服务端数据。这版不安装 APK，也不负责登录、创建或销毁云实例。
+它不会重置其他 App、系统设置、SD 卡或服务端数据。当前不安装 APK、不负责登录；外部设备模式也不会创建或销毁操作者的实例。
 
 正常取消：
 
@@ -244,6 +243,8 @@ python explore_batch.py run --concurrency 2 --adb /absolute/path/to/adb
 | `worker.py` | 准备、执行、心跳、结果校验、发布与清理 |
 | `process_runner.py` | 独立进程组、取消、超时及有界终止 |
 | `environments.py` | 已连接云沙箱的 ADB 就绪检查与 App 重置 |
+| `cloud_environments.py` | 托管实例的准备、分配绑定、补偿回收和重启巡检 |
+| `agr.py` | 腾讯云 AGR 控制面、ADB 隧道及结构化结果适配 |
 | `locks.py` | 协调器锁和可传递给探索子进程的设备锁 |
 | `cli.py` | 参数解析与具体组件组装 |
 

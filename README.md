@@ -2,7 +2,7 @@
 
 通过 ADB 操作腾讯云 Android World sandbox，以视觉模型理解界面，记录页面、状态、动作和验证证据。多个 App 使用独立 Worker 进程和独占设备并发运行，可选独立模型生成 App 功能总结。
 
-云实例和 ADB 隧道由 AGR 管理；仓库内的环境管理器负责连接就绪检查与 App 清理。App 的启动、退出、恢复和路径重放仍由 harness 管理。
+环境管理器通过 AGR 自动创建云实例、建立 ADB 隧道、检查 Android 和 App，并在任务结束后释放资源。App 的启动、退出、恢复和路径重放仍由 harness 管理。
 
 ## 安装与配置
 
@@ -23,18 +23,17 @@ cp .env.example .env  # 首次配置时执行；已有 .env 请保留
 
 ## 并发探索
 
-先按 [云沙箱操作指南](docs/cloud-sandbox.md) 创建实例并连接 ADB。将以下端口占位符替换为 `adb devices -l` 中的真实地址：
+先按 [云沙箱操作指南](docs/cloud-sandbox.md) 安装 AGR / ADB 并配置腾讯云凭据。只需一个已有 Android World 工具模板，每个任务尝试会自动创建独占实例：
 
 ```bash
-python explore_batch.py env add --device 127.0.0.1:PORT_A
-python explore_batch.py env add --device 127.0.0.1:PORT_B
-python explore_batch.py env add --device 127.0.0.1:PORT_C
 python explore_batch.py enqueue examples/cloud_tasks.json
-python explore_batch.py run --concurrency 3
+python explore_batch.py run --tool-id sdt-YOUR_TOOL_ID --region ap-guangzhou --concurrency 3
 python explore_batch.py status
 ```
 
-示例包含 Tasks、Markor、Draw 三个 App，每个探索 3 步，继承 `.env` 的总结配置。使用前确认这三个 App 已安装到所有候选设备；未固定设备端口，重新连接后重新登记设备，并为新批次选择新的 `--db`。
+示例包含 Tasks、Markor、Draw 三个 App，每个探索 3 步，继承 `.env` 的总结配置。所选云镜像必须已安装目标 App；托管模式不固定 ADB 端口，也不需要 `env add`。可以在 `.env` 设置 `CLOUD_SANDBOX_TOOL_ID`、`CLOUD_SANDBOX_REGION`，后续只运行 `run --concurrency 3`。
+
+取消、超时和普通失败也会回收实例。回收失败会保留 `cloud_resources` 记录并返回退出码 2，可用 `python explore_batch.py env cleanup` 重试；只处理该队列创建的实例。已有手动连接的云设备仍可通过 `env add` 使用，手动模式不删除外部实例，详见操作指南。
 
 GLM 示例关闭 embedding 语义检索，保留视觉判重；若启用语义检索，需要额外配置支持 embedding 的模型服务。
 
@@ -65,7 +64,7 @@ auto-explore/
   output/                   # 忽略：队列、日志、图谱、截图和诊断证据
 ```
 
-默认队列为 `output/batch/queue.sqlite3`，每次执行的结果位于 `artifacts/<task_id>/<attempt_id>/`。`run` 在队列排空后退出，云端常驻实例需另行释放。
+默认队列为 `output/batch/queue.sqlite3`，每次执行的结果位于 `artifacts/<task_id>/<attempt_id>/`。`environment.json` 保存稳定环境 ID、本次云实例 ID 和 ADB 地址；图谱留在本机。托管模式排空队列后，实例及隧道已释放；若存在回收欠账，命令返回非零并保留恢复信息。
 
 之前的三 App 联调、诊断证据和图谱查看器保留在 `output/glm-smoke-20261020/`。导出或打开已有图谱不需要运行 sandbox：
 
@@ -76,6 +75,8 @@ python -m http.server 8000 --bind 127.0.0.1 --directory output/glm-smoke-2026102
 ```
 
 浏览器打开 <http://127.0.0.1:8000/visualizations/index.html>。
+
+托管生命周期的真实并发验证记录位于 `output/managed-cloud-smoke-20261021/verification.json`：Tasks / Markor 每任务一动作，确认自动创建、连接、探索、回收。该批次四个实例均为 STOPPED、无遗留隧道；短程验证不代表完整 App 覆盖。
 
 ## 开发与文档
 

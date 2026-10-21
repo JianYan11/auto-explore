@@ -48,6 +48,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS attempt_task_exclusive ON attempts(task_id)
     WHERE state IN ('preparing', 'running', 'finalizing');
 """
 
+CLOUD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cloud_resources (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    environment_id TEXT NOT NULL REFERENCES environments(serial),
+    tool_id TEXT NOT NULL, region TEXT NOT NULL, client_token TEXT NOT NULL UNIQUE,
+    timeout_seconds INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'planned', instance_id TEXT NOT NULL DEFAULT '',
+    adb_serial TEXT NOT NULL DEFAULT '', tunnel_pid INTEGER,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL, error TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_slot_exclusive ON cloud_resources(environment_id)
+    WHERE state != 'released';
+"""
+
 
 class TaskStore:
     def __init__(self, path: Path):
@@ -56,10 +70,20 @@ class TaskStore:
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise ValueError(f"Unsupported queue schema version: {version}")
             db.executescript(SCHEMA)
-            db.execute("PRAGMA user_version=1")
+        # Additive migration: existing queue histories and external ADB registrations
+        # remain usable. Concurrent CLI readers serialize only this short migration.
+        with self.connection(write=True) as db:
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(environments)")}
+            for name, default in (("provider", "adb"), ("tool_id", ""), ("region", "")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE environments ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
+            for statement in CLOUD_SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute("PRAGMA user_version=2")
 
     @contextmanager
     def connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -96,7 +120,9 @@ class TaskStore:
         if reset_policy not in {"restart", "clear-data"}:
             raise ValueError("reset_policy must be restart or clear-data")
         with self.connection(write=True) as db:
-            current = db.execute("SELECT state FROM environments WHERE serial=?", (serial,)).fetchone()
+            current = db.execute("SELECT state,provider FROM environments WHERE serial=?", (serial,)).fetchone()
+            if current and current["provider"] != "adb":
+                raise ValueError("Managed cloud slots cannot be registered as ADB devices")
             if current and current["state"] == "busy":
                 raise ValueError("Cannot change an occupied environment")
             db.execute("INSERT INTO environments(serial,reset_policy) VALUES(?,?) "
@@ -104,10 +130,10 @@ class TaskStore:
 
     def snapshot(self) -> dict:
         with self.connection() as db:
-            db.execute("BEGIN")  # Keep all three table reads in one WAL snapshot.
+            db.execute("BEGIN")  # Keep task, allocation and resource reads in one WAL snapshot.
             result = {table: [dict(r) for r in db.execute(f"SELECT * FROM {table} ORDER BY {order}")]
                       for table, order in (("tasks", "sequence"), ("attempts", "created_at,id"),
-                                           ("environments", "serial"))}
+                                           ("environments", "serial"), ("cloud_resources", "created_at,attempt_id"))}
         for task in result["tasks"]:
             task["spec"] = json.loads(task["spec"])
         return result
@@ -201,6 +227,8 @@ class TaskStore:
 
     def recover_environment(self, serial: str) -> None:
         with self.connection(write=True) as db:
+            if db.execute("SELECT 1 FROM cloud_resources WHERE environment_id=? AND state!='released'", (serial,)).fetchone():
+                raise ValueError("Cloud resources must be released before recovering the environment")
             changed = db.execute("UPDATE environments SET state='available',error='',active_attempt_id=NULL "
                                  "WHERE serial=? AND state='quarantined'", (serial,)).rowcount
             if changed != 1:
@@ -218,3 +246,48 @@ class TaskStore:
                 db.execute("UPDATE environments SET state='quarantined',active_attempt_id=NULL,error='coordinator_lost' WHERE serial=?",
                            (row["serial"],))
             return len(rows)
+
+    def ensure_cloud_pool(self, tool_id: str, region: str, size: int) -> list[str]:
+        """Create logical capacity only; provisioning is lazy after task allocation."""
+        if type(size) is not int or size < 1:
+            raise ValueError("Cloud pool size must be a positive integer")
+        with self.connection(write=True) as db:
+            slots = [r[0] for r in db.execute(
+                "SELECT serial FROM environments WHERE provider='tencent' AND tool_id=? AND region=? ORDER BY serial",
+                (tool_id, region))]
+            while len(slots) < size:
+                slot = "cloud:" + uuid4().hex
+                db.execute("INSERT INTO environments(serial,reset_policy,provider,tool_id,region) "
+                           "VALUES(?,'restart','tencent',?,?)", (slot, tool_id, region))
+                slots.append(slot)
+            return slots
+
+    def begin_cloud_resource(self, assignment: Assignment, timeout_seconds: int) -> dict:
+        now = time.time()
+        with self.connection(write=True) as db:
+            env = db.execute("SELECT e.* FROM environments e JOIN attempts a ON a.id=e.active_attempt_id "
+                             "WHERE e.serial=? AND a.id=? AND a.owner=? AND e.provider='tencent' AND e.state='busy'",
+                             (assignment.device, assignment.attempt_id, assignment.owner)).fetchone()
+            if env is None:
+                raise RuntimeError("Cloud environment ownership was lost")
+            db.execute("INSERT INTO cloud_resources(attempt_id,environment_id,tool_id,region,client_token,timeout_seconds,"
+                       "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (assignment.attempt_id, assignment.device, env["tool_id"], env["region"],
+                        uuid4().hex, timeout_seconds, now, now))
+            return dict(db.execute("SELECT * FROM cloud_resources WHERE attempt_id=?", (assignment.attempt_id,)).fetchone())
+
+    def update_cloud_resource(self, attempt_id: str, **changes: object) -> None:
+        allowed = {"state", "instance_id", "adb_serial", "tunnel_pid", "error"}
+        if not changes or changes.keys() - allowed:
+            raise ValueError("Invalid cloud resource update")
+        changes["updated_at"] = time.time()
+        with self.connection(write=True) as db:
+            changed = db.execute("UPDATE cloud_resources SET " + ",".join(f"{key}=?" for key in changes) +
+                                 " WHERE attempt_id=?", (*changes.values(), attempt_id)).rowcount
+            if changed != 1:
+                raise RuntimeError("Unknown cloud resource")
+
+    def cloud_resources(self, *, pending_only: bool = True) -> list[dict]:
+        with self.connection() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM cloud_resources" +
+                    (" WHERE state!='released'" if pending_only else "") + " ORDER BY created_at,attempt_id")]
