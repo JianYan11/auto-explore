@@ -37,13 +37,13 @@ class ProcessRunner:
         # before the device lock can be released or an environment reused.
         self._signal(process.pid, signal.SIGKILL)
 
-    def run(self, command: list[str], output: Path, *, lock_fd: int,
+    def run(self, command: list[str], output: Path, *, lock_fd: int | tuple[int, ...],
             check: Callable[[], None], on_start: Callable[[int], None]) -> int:
         check()
         with output.open("ab", buffering=0) as log:
             process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                start_new_session=True, pass_fds=(lock_fd,),
+                start_new_session=True, pass_fds=(lock_fd,) if isinstance(lock_fd, int) else lock_fd,
             )
             try:
                 on_start(process.pid)

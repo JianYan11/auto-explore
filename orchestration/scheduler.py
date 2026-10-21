@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event
 from uuid import uuid4
+from typing import Callable
 
 from .locks import FileLock, LockBusy, device_lock_path
 from .models import positive_seconds
@@ -20,7 +21,9 @@ LOG = logging.getLogger(__name__)
 
 class Scheduler:
     def __init__(self, store: SchedulerRepository, worker: TaskExecutor, output_root: Path, stop: Event,
-                 *, concurrency: int = 2, poll_interval: float = 0.2, lock_root: Path | None = None):
+                 *, concurrency: int = 2, poll_interval: float = 0.2, lock_root: Path | None = None,
+                 startup: Callable[[], None] | None = None,
+                 environment_filter: Callable[[dict], bool] | None = None):
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("concurrency must be a positive integer")
         self.store, self.worker, self.output_root, self.stop = store, worker, output_root, stop
@@ -28,12 +31,16 @@ class Scheduler:
         self.poll_interval = positive_seconds(poll_interval, "poll_interval")
         self.lock_root = lock_root
         self.owner = uuid4().hex
+        self.startup = startup
+        self.environment_filter = environment_filter or (lambda env: env["provider"] == "adb")
 
     def run(self) -> dict:
         with FileLock(Path(str(self.store.path) + ".coordinator.lock")):
             recovered = self.store.recover_interrupted()
             if recovered:
                 LOG.warning("Marked %s abandoned attempts lost; their environments are quarantined", recovered)
+            if self.startup is not None:
+                self.startup()
             active: dict[Future, str] = {}
             incomplete = False
             with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="explore-worker") as pool:
@@ -54,7 +61,7 @@ class Scheduler:
                             for env in view["environments"]:
                                 if self.stop.is_set() or len(active) >= self.concurrency:
                                     break
-                                if env["state"] != "available":
+                                if not self.environment_filter(env) or env["state"] != "available":
                                     continue
                                 if not any(not t["spec"]["devices"] or env["serial"] in t["spec"]["devices"] for t in ready):
                                     continue
@@ -82,7 +89,8 @@ class Scheduler:
                         pending = [t for t in pending_view["tasks"] if t["state"] in {"queued", "retry_wait"}]
                         if self.stop.is_set() or not pending:
                             break
-                        available = {e["serial"] for e in pending_view["environments"] if e["state"] == "available"}
+                        available = {e["serial"] for e in pending_view["environments"]
+                                     if self.environment_filter(e) and e["state"] == "available"}
                         compatible = [t for t in pending if not t["spec"]["devices"] or available.intersection(t["spec"]["devices"])]
                         if not available or not compatible:
                             incomplete = True
@@ -96,7 +104,8 @@ class Scheduler:
 
             final = self.store.snapshot()
             counts = dict(Counter(t["state"] for t in final["tasks"]))
-            exit_code = (130 if self.stop.is_set() else 2 if incomplete else
+            cleanup_pending = sum(r["state"] != "released" for r in final["cloud_resources"])
+            exit_code = (130 if self.stop.is_set() else 2 if incomplete or cleanup_pending else
                          1 if counts.get("failed", 0) or counts.get("cancelled", 0) else 0)
             return {"tasks": counts, "environments": dict(Counter(e["state"] for e in final["environments"])),
-                    "exit_code": exit_code, "recovered_attempts": recovered}
+                    "exit_code": exit_code, "recovered_attempts": recovered, "cleanup_pending": cleanup_pending}

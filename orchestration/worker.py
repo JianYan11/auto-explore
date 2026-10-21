@@ -6,14 +6,14 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event
 from typing import Callable
 
 from .errors import EnvironmentFailure, ExecutionAborted
 from .models import Assignment, Outcome, SUCCESS_REASONS
-from .ports import DeviceLease, EnvironmentManager, ProcessExecutor, WorkerRepository
+from .ports import DeviceLease, EnvironmentManager, PreparedEnvironment, ProcessExecutor, WorkerRepository
 
 
 def explorer_command(assignment: Assignment, adb: str, *, python: str = sys.executable) -> list[str]:
@@ -83,6 +83,7 @@ class Worker:
         environment_error = ""
         output = Path(assignment.output_dir)
         outcome = Outcome("failed", "worker_error", "Worker did not finish")
+        prepared = PreparedEnvironment(assignment.device)
 
         def check() -> None:
             nonlocal last_heartbeat
@@ -104,11 +105,22 @@ class Worker:
                 })
                 check()
                 touched_environment = True
-                self.environments.prepare(assignment, deadline, check)
+                prepared = self.environments.prepare(assignment, deadline, check)
+                # Queue ownership belongs to the stable environment slot. Only the
+                # explorer command sees the ephemeral ADB transport address.
+                execution = replace(assignment, device=prepared.device)
+                atomic_json(output / "environment.json", {
+                    "environment_id": assignment.device, "adb_serial": prepared.device,
+                    "instance_id": prepared.instance_id,
+                })
                 check()
                 assert device_lock.fd is not None
+                lock_fds = (device_lock.fd,)
+                if prepared.lease is not None:
+                    assert prepared.lease.fd is not None
+                    lock_fds += (prepared.lease.fd,)
                 returncode = self.runner.run(
-                    self.command_builder(assignment, self.adb), output / "worker.log", lock_fd=device_lock.fd,
+                    self.command_builder(execution, self.adb), output / "worker.log", lock_fd=lock_fds,
                     check=check, on_start=lambda pid: self.store.touch(assignment, state="running", pid=pid),
                 )
                 self.store.touch(assignment, state="finalizing")
@@ -130,12 +142,18 @@ class Worker:
                 # Unexpected failures may include inability to stop the process group.
                 environment_error = str(exc) if touched_environment else ""
 
-            self.store.touch(assignment, state="finalizing")
-            if touched_environment:
-                try:
-                    self.environments.reset(assignment.device, cleanup_package, assignment.reset_policy)
-                except Exception as exc:
-                    environment_error = f"Environment cleanup failed: {type(exc).__name__}: {exc}"
+            try:
+                self.store.touch(assignment, state="finalizing")
+            finally:
+                # Even a failed database heartbeat must not skip cloud release.
+                if touched_environment:
+                    try:
+                        if self.environments.reset(assignment.device, cleanup_package, assignment.reset_policy):
+                            # Disposable environments were fully released. A failed
+                            # boot does not poison the logical capacity slot.
+                            environment_error = ""
+                    except Exception as exc:
+                        environment_error = f"Environment cleanup failed: {type(exc).__name__}: {exc}"
             # A valid exploration stays successful even when its environment needs repair.
             if self.store.is_cancelled(assignment.task_id) or self.stop.is_set():
                 outcome = Outcome("cancelled", "cancelled", returncode=outcome.returncode)
@@ -153,4 +171,6 @@ class Worker:
             self.store.finish(assignment, outcome, environment_error)
             return outcome
         finally:
+            if prepared.lease is not None:
+                prepared.lease.close()
             device_lock.close()
